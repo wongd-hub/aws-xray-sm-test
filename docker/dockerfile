@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y curl unzip netcat-openbsd && \
     rm -rf /var/lib/apt/lists/* /tmp/xray.zip
 
 WORKDIR /opt/app
-COPY plumber.R plumber.R /opt/app/
+COPY plumber.R start.sh /opt/app/
+RUN chmod +x /opt/app/start.sh
 
 EXPOSE 8080
 
-ENTRYPOINT ["bash","-lc","/usr/local/bin/xray --region ${AWS_REGION:-ap-southeast-2} & echo 'Waiting for X-Ray daemon to be ready...' && sleep 3 && for i in {1..10}; do nc -z 127.0.0.1 2000 && break || sleep 1; done && echo 'X-Ray daemon ready, starting R...' && R -e \"pr <- plumber::plumb('/opt/app/plumber.R'); pr\\$run(host='0.0.0.0', port=8080)\""]
+ENTRYPOINT ["/opt/app/start.sh"]

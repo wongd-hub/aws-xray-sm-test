@@ -1,6 +1,5 @@
 library(plumber)
 library(jsonlite)
-library(httr)
 
 # Functions ----
 
@@ -14,6 +13,9 @@ rand_hex <- function(n) {
 }
 
 extract_root <- function(trace_header) {
+  if (is.null(trace_header) || length(trace_header) == 0) {
+    return(NULL)
+  }
   m <- regmatches(trace_header, regexec("Root=([^;]+)", trace_header))[[1]]
   if (length(m)>1) m[2] else NULL
 }
@@ -42,25 +44,24 @@ send_xray_segment <- function(
   )
   if (!is.null(parent_id)) seg$parent_id <- parent_id
 
-  # # serialize to compact JSON
-  # payload <- toJSON(seg, auto_unbox=TRUE)
+  # serialize to compact JSON
+  payload <- toJSON(seg, auto_unbox=TRUE)
 
-  # wrap in the PutTraceSegments API format
-  body <- list( TraceSegmentDocuments = list(toJSON(seg, auto_unbox=TRUE)) )
-
-  # send over UDP to X-Ray daemon
-  # cmd <- sprintf("printf %s | nc -u -w1 127.0.0.1 2000", shQuote(payload))
-  # system(cmd, ignore.stdout=TRUE, ignore.stderr=TRUE)
-  # POST to the local daemon’s HTTP proxy
-  resp <- POST(
-    url    = "http://127.0.0.1:2000/TraceSegments",
-    body   = body,
-    encode = "json",
-    timeout(1)
-  )
-  if (http_error(resp)) {
-    warning("X-Ray daemon HTTP error: ", status_code(resp))
-  }
+  # send over UDP to X-Ray daemon using netcat with proper format
+  tryCatch({
+    cat("Sending X-Ray segment:", substr(payload, 1, 100), "...\n")
+    
+    # X-Ray daemon expects UDP segments with format: 
+    # {"format": "json", "version": 1}\n{segment_json}
+    header <- '{"format": "json", "version": 1}'
+    full_payload <- paste0(header, "\n", payload)
+    
+    cmd <- sprintf("printf %s | nc -u -w1 127.0.0.1 2000", shQuote(full_payload))
+    result <- system(cmd, ignore.stdout=FALSE, ignore.stderr=FALSE)
+    cat("X-Ray segment sent successfully (exit code:", result, ")\n")
+  }, error = function(e) {
+    cat("Warning: Could not send X-Ray segment:", e$message, "\n")
+  })
 
 }
 
@@ -80,15 +81,81 @@ function() {
 function(req, res) {
   payload <- fromJSON(req$postBody)
 
-  # grab incoming trace header if present
+  # Log all headers to debug X-Ray tracing
+  cat("=== DEBUG: All request headers ===\n")
+  headers <- names(req)
+  for(h in headers[grepl("HTTP_", headers)]) {
+    cat(sprintf("%s: %s\n", h, req[[h]]))
+  }
+  cat("===================================\n")
+
+  # grab incoming trace header from standard location or custom attributes
   incoming <- req$HTTP_X_AMZN_TRACE_ID
-  # start a new segment/subsegment
-  send_xray_segment("my-inference", trace_header = incoming, annotations = list(job="async-123"))
+  
+  # If not in standard header, check custom attributes (SageMaker async pattern)
+  if (is.null(incoming) && !is.null(req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES)) {
+    custom_attrs <- req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES
+    cat("Custom attributes:", custom_attrs, "\n")
+    cat("Custom attributes class:", class(custom_attrs), "\n")
+    cat("Custom attributes length:", length(custom_attrs), "\n")
+    
+    # Extract trace ID from custom attributes: "X-Amzn-Trace-Id=1-xxxxx-xxxx"
+    cat("Checking if contains X-Amzn-Trace-Id...\n")
+    contains_trace <- grepl("X-Amzn-Trace-Id=", custom_attrs)
+    cat("Contains trace ID:", contains_trace, "\n")
+    
+    if (contains_trace) {
+      cat("Attempting to split on 'X-Amzn-Trace-Id='...\n")
+      trace_parts <- strsplit(custom_attrs, "X-Amzn-Trace-Id=")[[1]]
+      cat("Split result:", paste(trace_parts, collapse=" | "), "\n")
+      cat("Number of parts:", length(trace_parts), "\n")
+      
+      if (length(trace_parts) >= 2) {
+        # Take everything after "X-Amzn-Trace-Id=" and remove any trailing whitespace/commas
+        trace_candidate <- trace_parts[2]
+        cat("Raw trace candidate:", trace_candidate, "\n")
+        trace_candidate <- gsub("^\\s+|\\s+$|,$", "", trace_candidate)  # trim whitespace and trailing comma
+        cat("Cleaned trace candidate:", trace_candidate, "\n")
+        cat("Trace candidate length:", nchar(trace_candidate), "\n")
+        
+        if (nchar(trace_candidate) > 0) {
+          incoming <- trace_candidate
+          cat("SUCCESS: Extracted trace ID from custom attributes:", incoming, "\n")
+        } else {
+          cat("ERROR: Trace candidate is empty after cleaning\n")
+        }
+      } else {
+        cat("ERROR: Not enough parts after split\n")
+      }
+    } else {
+      cat("ERROR: Custom attributes do not contain 'X-Amzn-Trace-Id='\n")
+    }
+  } else {
+    if (is.null(req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES)) {
+      cat("No custom attributes found in request\n")
+    } else {
+      cat("Standard X-Ray header already found, skipping custom attributes\n")
+    }
+  }
+  
+  cat("X-Ray trace header:", if(is.null(incoming)) "NULL" else incoming, "\n")
+
+  # Only send X-Ray segment if we have a valid trace context from SageMaker
+  if (!is.null(incoming) && incoming != "") {
+    cat("Sending X-Ray segment with trace context\n")
+    send_xray_segment("my-inference", trace_header = incoming, annotations = list(job="async-123"))
+  } else {
+    cat("No X-Ray trace header from SageMaker - skipping segment\n")
+  }
 
   # …your real inference logic here…
   list(
     message   = "Hello from R!",
     input     = payload,
-    timestamp = format(Sys.time(), tz="UTC", usetz=TRUE)
+    timestamp = format(Sys.time(), tz="UTC", usetz=TRUE),
+    xray_debug = list(
+      trace_header = incoming,
+      headers_count = length(headers[grepl("HTTP_", headers)])
+    )
   )
 }
