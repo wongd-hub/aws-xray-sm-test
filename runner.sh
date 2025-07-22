@@ -49,6 +49,8 @@ else
     log "Using provided ACCOUNT_ID: $ACCOUNT_ID"
 fi
 
+# ECR repository will be managed by Terraform
+
 # Check if Docker image exists
 log "Checking if Docker image 'xray-rocker-model' exists..."
 if ! docker images | grep -q "xray-rocker-model" || [ "$force_docker_rebuild" = true ]; then
@@ -155,23 +157,9 @@ fi
 
 log_success "Docker container test completed successfully"
 
-# Push to ECR
+# Push to ECR (repository managed by Terraform)
 if [ -n "$ACCOUNT_ID" ]; then
-    log "Preparing ECR repository..."
-    
-    # Check if ECR repository exists, create if not
-    log "Checking if ECR repository 'xray-rocker-model' exists..."
-    if aws ecr describe-repositories --repository-names xray-rocker-model --region us-east-1 > /dev/null 2>&1; then
-        log "ECR repository already exists"
-    else
-        log "ECR repository does not exist, creating..."
-        if aws ecr create-repository --repository-name xray-rocker-model --region us-east-1 > /dev/null 2>&1; then
-            log_success "ECR repository 'xray-rocker-model' created successfully"
-        else
-            log_error "Failed to create ECR repository 'xray-rocker-model'"
-            exit 1
-        fi
-    fi
+    log "Preparing to push to ECR repository..."
     
     log "Logging into ECR..."
     if aws ecr get-login-password \
@@ -202,9 +190,27 @@ fi
 
 # Deploy with Terraform
 log "Starting Terraform deployment..."
+
+# Check if SageMaker endpoint exists and delete it before applying Terraform
+log "Checking for existing SageMaker endpoint..."
+ENDPOINT_NAME="xray-rocker-model-async-endpoint"
+if aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" >/dev/null 2>&1; then
+    log "Found existing endpoint '$ENDPOINT_NAME', deleting it..."
+    aws sagemaker delete-endpoint --endpoint-name "$ENDPOINT_NAME"
+    
+    # Wait for endpoint deletion to complete
+    log "Waiting for endpoint deletion to complete..."
+    while aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" >/dev/null 2>&1; do
+        echo -n "."
+        sleep 10
+    done
+    log_success "Endpoint deletion completed"
+else
+    log "No existing endpoint found, proceeding with deployment"
+fi
+
 (
     cd terraform && \
-    export TF_PLUGIN_TIMEOUT=300 && \
     log "Initializing Terraform..." && \
     terraform init && \
     log_success "Terraform initialized" && \
