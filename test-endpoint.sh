@@ -19,7 +19,7 @@ echo "Trace ID: $TRACE_ID"
 echo
 
 # Create test payload - simple JSON
-TEST_PAYLOAD='{"foo": "bar"}'
+TEST_PAYLOAD='{"input": "test data for subsegments"}'
 
 echo "📦 Sending payload: $TEST_PAYLOAD"
 echo

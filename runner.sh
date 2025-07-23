@@ -74,7 +74,7 @@ log "Preparing to test Docker image..."
 # if docker/sample.json doesn't exist, create it
 if [ ! -f docker/sample.json ]; then
     log "Creating sample.json for testing..."
-    echo "{\"foo\": \"bar\"}" > docker/sample.json
+    echo "{\"input\": \"test data for subsegments\"}" > docker/sample.json
 else
     log "Found existing docker/sample.json"
 fi
@@ -126,10 +126,11 @@ if [ "$api_ready" = true ]; then
     fi
     
     # Send sample.json to the /invocations endpoint
-    log "Sending POST request to /invocations..."
+    TRACE_ID="Root=1-$(printf '%x' $(date +%s))-$(openssl rand -hex 12);Sampled=1"
+    log "Sending POST request to /invocations with trace ID: $TRACE_ID"
     response=$(curl -s -X POST \
       -H "Content-Type: application/json" \
-      -H "X-Amzn-Trace-Id: Root=1-67891233-abcdef012345678912345678;Sampled=1" \
+      -H "X-Amzn-Trace-Id: $TRACE_ID" \
       --data-binary @docker/sample.json \
       http://localhost:8080/invocations)
     
@@ -214,6 +215,17 @@ fi
     log "Initializing Terraform..." && \
     terraform init && \
     log_success "Terraform initialized" && \
+    log "Checking if ECR repository needs to be imported..." && \
+    if ! terraform state show aws_ecr_repository.model_repo >/dev/null 2>&1; then \
+        log "ECR repository not in state, attempting to import existing repository..." && \
+        if terraform import aws_ecr_repository.model_repo xray-rocker-model >/dev/null 2>&1; then \
+            log_success "ECR repository imported successfully"; \
+        else \
+            log "ECR repository import failed (repository may not exist yet, will be created)"; \
+        fi; \
+    else \
+        log "ECR repository already in Terraform state"; \
+    fi && \
     log "Creating Terraform plan..." && \
     terraform plan -out=tfplan.out && \
     log_success "Terraform plan created" && \

@@ -1,161 +1,362 @@
 library(plumber)
 library(jsonlite)
 
-# Functions ----
-
-# Nullish coalescer infix operator: returns left if not NULL, else right
+# Helper functions (internal) ----
 `%||%` <- function(x, y) {
   if (!is.null(x)) x else y
 }
 
 rand_hex <- function(n) {
-  paste0(sample(c(0:9, letters[1:6]), n, replace=TRUE), collapse="")
+  paste0(sample(c(0:9, letters[1:6]), n, replace = TRUE), collapse = "")
 }
 
 extract_root <- function(trace_header) {
   if (is.null(trace_header) || length(trace_header) == 0) {
     return(NULL)
   }
-  m <- regmatches(trace_header, regexec("Root=([^;]+)", trace_header))[[1]]
-  if (length(m)>1) m[2] else NULL
+  
+  # Handle two formats:
+  # 1. "Root=1-xxx-xxx" (full format)
+  # 2. "1-xxx-xxx" (just the trace ID part)
+  if (grepl("Root=", trace_header)) {
+    # Extract from "Root=1-xxx-xxx" format
+    m <- regmatches(trace_header, regexec("Root=([^;]+)", trace_header))[[1]]
+    if (length(m) > 1) m[2] else NULL
+  } else if (grepl("^1-[0-9a-f]+-[0-9a-f]+", trace_header)) {
+    # Already in "1-xxx-xxx" format, use as-is
+    trace_header
+  } else {
+    NULL
+  }
 }
 
-# Build & send a segment to the local daemon
-send_xray_segment <- function(
-  name,
-  trace_header = NULL,      # propagate from incoming header or leave NULL to start a new trace
-  parent_id    = NULL,      # if creating a subsegment
-  annotations  = list()
-) {
-
-  now <- as.numeric(Sys.time())
-  trace_id <- extract_root(trace_header)
+# Internal segment sender (thread-safe)
+.send_xray_segment <- function(name, start_time, end_time, parent_id = NULL, 
+                               trace_id = NULL, annotations = list(), 
+                               error = NULL, metadata = list(), segment_id = NULL) {
+  
+  if (is.null(trace_id)) return(NULL)  # Must have trace_id to send segments
+  
   seg <- list(
-    name        = name,
-    id          = rand_hex(16),
-    trace_id    = if (!is.null(trace_id)) trace_id else paste0(
-                   "1-",
-                   toupper(as.hexmode(as.integer(now))), "-",
-                   rand_hex(24)
-                 ),
-    start_time  = now,
-    end_time    = now,
+    name = name,
+    id = if (!is.null(segment_id)) segment_id else rand_hex(16),
+    trace_id = trace_id,  # Use the provided trace_id directly
+    start_time = start_time,
+    end_time = end_time,
     annotations = annotations
   )
-  if (!is.null(parent_id)) seg$parent_id <- parent_id
+  
+  if (!is.null(parent_id)) {
+    seg$parent_id <- parent_id
+    seg$type <- "subsegment"
+  }
+  
+  if (!is.null(error)) {
+    seg$error <- TRUE
+    seg$cause <- list(
+      exceptions = list(
+        list(message = error, type = "InferenceError")
+      )
+    )
+  }
+  
+  if (length(metadata) > 0) {
+    seg$metadata <- metadata
+  }
 
-  # serialize to compact JSON
-  payload <- toJSON(seg, auto_unbox=TRUE)
+  payload <- toJSON(seg, auto_unbox = TRUE)
+  
+  cat("Sending X-Ray", if (!is.null(parent_id)) "subsegment:" else "segment:", 
+      name, "with trace_id:", trace_id, "\n")
 
-  # send over UDP to X-Ray daemon using netcat with proper format
   tryCatch({
-    cat("Sending X-Ray segment:", substr(payload, 1, 100), "...\n")
-    
-    # X-Ray daemon expects UDP segments with format: 
-    # {"format": "json", "version": 1}\n{segment_json}
     header <- '{"format": "json", "version": 1}'
     full_payload <- paste0(header, "\n", payload)
-    
     cmd <- sprintf("printf %s | nc -u -w1 127.0.0.1 2000", shQuote(full_payload))
-    result <- system(cmd, ignore.stdout=FALSE, ignore.stderr=FALSE)
-    cat("X-Ray segment sent successfully (exit code:", result, ")\n")
+    system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE)
   }, error = function(e) {
-    cat("Warning: Could not send X-Ray segment:", e$message, "\n")
+    cat("Warning: X-Ray segment send failed:", e$message, "\n")
   })
-
+  
+  return(seg$id)
 }
 
+# Initialize X-Ray context from request (thread-safe - returns context object)
+.init_xray_context <- function(req) {
+  context <- list(
+    trace_header = NULL,
+    trace_id = NULL,
+    parent_segment_id = NULL,
+    enabled = FALSE,
+    start_time = as.numeric(Sys.time())
+  )
+  
+  # Try to get trace header from standard location
+  incoming <- req$HTTP_X_AMZN_TRACE_ID
+  
+  # If not found, try SageMaker custom attributes
+  if (is.null(incoming) && !is.null(req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES)) {
+    custom_attrs <- req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES
+    if (grepl("X-Amzn-Trace-Id=", custom_attrs)) {
+      trace_parts <- strsplit(custom_attrs, "X-Amzn-Trace-Id=")[[1]]
+      if (length(trace_parts) >= 2) {
+        trace_candidate <- gsub("^\\s+|\\s+$|,$", "", trace_parts[2])
+        if (nchar(trace_candidate) > 0) {
+          incoming <- trace_candidate
+        }
+      }
+    }
+  }
+  
+  # Debug output
+  cat("=== X-Ray Debug ===\n")
+  cat("Incoming trace header:", if (is.null(incoming)) "NULL" else incoming, "\n")
+  
+  # Set up context if we have a trace header
+  if (!is.null(incoming) && incoming != "") {
+    context$trace_header <- incoming
+    context$trace_id <- extract_root(incoming)
+    context$enabled <- TRUE
+    
+    # Debug output
+    cat("Extracted trace ID:", if (is.null(context$trace_id)) "NULL" else context$trace_id, "\n")
+    
+    # Create main segment ID (but don't send segment yet - will send when complete)
+    context$parent_segment_id <- rand_hex(16)
+    cat("Generated parent segment ID:", context$parent_segment_id, "\n")
+  } else {
+    cat("No valid trace header found, X-Ray disabled\n")
+  }
+  cat("==================\n")
+  
+  return(context)
+}
 
+# Finalize X-Ray context (thread-safe - uses context object)
+.finalize_xray_context <- function(context, success = TRUE, error_message = NULL) {
+  if (context$enabled && !is.null(context$parent_segment_id)) {
+    end_time <- as.numeric(Sys.time())
+    
+    annotations <- list(
+      service = "r-plumber",
+      success = success,
+      duration_ms = (end_time - context$start_time) * 1000
+    )
+    
+    cat("Finalizing main segment with trace_id:", context$trace_id, "\n")
+    
+    # Now send the complete main segment
+    .send_xray_segment(
+      name = "inference-request",
+      start_time = context$start_time,
+      end_time = end_time,
+      parent_id = NULL,  # This is the root segment
+      trace_id = context$trace_id,  # Use stored trace_id
+      annotations = annotations,
+      error = error_message,
+      segment_id = context$parent_segment_id  # Use the pre-generated ID
+    )
+  }
+}
+
+# PUBLIC API: Simple tracing function for users (thread-safe) ----
+
+#' Trace an operation with X-Ray subsegments
+#' 
+#' @param expr R expression to execute and trace
+#' @param operation_name Name for the operation (will appear in X-Ray console)
+#' @return Result of the expression
+#' @examples
+#' result <- trace_operation({
+#'   Sys.sleep(0.1)
+#'   "Hello World"
+#' }, operation_name = "my-operation")
+trace_operation <- function(expr, operation_name = "operation") {
+  # Look for xray_context in the calling environment (thread-safe)
+  context <- tryCatch({
+    get("xray_context", envir = parent.frame())
+  }, error = function(e) {
+    list(enabled = FALSE, trace_id = NULL, parent_segment_id = NULL)
+  })
+  
+  if (!context$enabled || is.null(context$trace_id)) {
+    # No tracing context - just execute and return
+    return(eval.parent(substitute(expr)))
+  }
+  
+  start_time <- as.numeric(Sys.time())
+  
+  # Execute the expression and handle errors
+  tryCatch({
+    result <- eval.parent(substitute(expr))
+    end_time <- as.numeric(Sys.time())
+    
+    cat("Creating subsegment:", operation_name, "with parent:", context$parent_segment_id, "\n")
+    
+    # Send successful subsegment
+    .send_xray_segment(
+      name = operation_name,
+      start_time = start_time,
+      end_time = end_time,
+      parent_id = context$parent_segment_id,
+      trace_id = context$trace_id,  # Use stored trace_id
+      annotations = list(
+        duration_ms = (end_time - start_time) * 1000,
+        success = TRUE
+      )
+    )
+    
+    return(result)
+    
+  }, error = function(e) {
+    end_time <- as.numeric(Sys.time())
+    
+    # Send error subsegment
+    .send_xray_segment(
+      name = operation_name,
+      start_time = start_time,
+      end_time = end_time,
+      parent_id = context$parent_segment_id,
+      trace_id = context$trace_id,  # Use stored trace_id
+      annotations = list(
+        duration_ms = (end_time - start_time) * 1000,
+        success = FALSE
+      ),
+      error = e$message
+    )
+    
+    # Re-throw the error
+    stop(e)
+  })
+}
+
+# Business logic examples (pure functions - no tracing embedded) ----
+
+preprocess_data <- function(payload) {
+  cat("Preprocessing data...\n")
+  Sys.sleep(0.1)  # Simulate work
+  
+  if (is.null(payload$input)) {
+    stop("Missing required 'input' field")
+  }
+  
+  list(
+    processed_input = toupper(as.character(payload$input)),
+    timestamp = Sys.time()
+  )
+}
+
+run_inference <- function(processed_data) {
+  cat("Running model inference...\n")
+  Sys.sleep(0.2)  # Simulate model execution
+  
+  list(
+    prediction = paste("PROCESSED:", processed_data$processed_input),
+    confidence = runif(1, 0.8, 0.99),
+    model_version = "v1.2.3"
+  )
+}
+
+postprocess_results <- function(inference_result) {
+  cat("Post-processing results...\n")
+  Sys.sleep(0.05)  # Simulate post-processing
+  
+  list(
+    final_result = inference_result$prediction,
+    confidence_score = round(inference_result$confidence, 3),
+    model_metadata = inference_result$model_version,
+    postprocessed_at = Sys.time()
+  )
+}
 
 # Routes ----
 
-# Health check
 #* @get /ping
 function() {
-  list(status="ok")
+  list(status = "ok")
 }
 
-# Inference entrypoint
 #* @post /invocations
 #* @serializer unboxedJSON
 function(req, res) {
+  # Initialize X-Ray context (thread-safe - each request gets its own context)
+  xray_context <- .init_xray_context(req)
+  
   payload <- fromJSON(req$postBody)
-
-  # Log all headers to debug X-Ray tracing
-  cat("=== DEBUG: All request headers ===\n")
-  headers <- names(req)
-  for(h in headers[grepl("HTTP_", headers)]) {
-    cat(sprintf("%s: %s\n", h, req[[h]]))
-  }
-  cat("===================================\n")
-
-  # grab incoming trace header from standard location or custom attributes
-  incoming <- req$HTTP_X_AMZN_TRACE_ID
   
-  # If not in standard header, check custom attributes (SageMaker async pattern)
-  if (is.null(incoming) && !is.null(req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES)) {
-    custom_attrs <- req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES
-    cat("Custom attributes:", custom_attrs, "\n")
-    cat("Custom attributes class:", class(custom_attrs), "\n")
-    cat("Custom attributes length:", length(custom_attrs), "\n")
+  tryCatch({
+    # Users wrap their function calls with trace_operation() - clean and simple!
+    processed_data <- trace_operation({
+      preprocess_data(payload)
+    }, operation_name = "data-preprocessing")
     
-    # Extract trace ID from custom attributes: "X-Amzn-Trace-Id=1-xxxxx-xxxx"
-    cat("Checking if contains X-Amzn-Trace-Id...\n")
-    contains_trace <- grepl("X-Amzn-Trace-Id=", custom_attrs)
-    cat("Contains trace ID:", contains_trace, "\n")
+    inference_result <- trace_operation({
+      run_inference(processed_data)
+    }, operation_name = "model-inference")
     
-    if (contains_trace) {
-      cat("Attempting to split on 'X-Amzn-Trace-Id='...\n")
-      trace_parts <- strsplit(custom_attrs, "X-Amzn-Trace-Id=")[[1]]
-      cat("Split result:", paste(trace_parts, collapse=" | "), "\n")
-      cat("Number of parts:", length(trace_parts), "\n")
-      
-      if (length(trace_parts) >= 2) {
-        # Take everything after "X-Amzn-Trace-Id=" and remove any trailing whitespace/commas
-        trace_candidate <- trace_parts[2]
-        cat("Raw trace candidate:", trace_candidate, "\n")
-        trace_candidate <- gsub("^\\s+|\\s+$|,$", "", trace_candidate)  # trim whitespace and trailing comma
-        cat("Cleaned trace candidate:", trace_candidate, "\n")
-        cat("Trace candidate length:", nchar(trace_candidate), "\n")
-        
-        if (nchar(trace_candidate) > 0) {
-          incoming <- trace_candidate
-          cat("SUCCESS: Extracted trace ID from custom attributes:", incoming, "\n")
-        } else {
-          cat("ERROR: Trace candidate is empty after cleaning\n")
-        }
-      } else {
-        cat("ERROR: Not enough parts after split\n")
-      }
-    } else {
-      cat("ERROR: Custom attributes do not contain 'X-Amzn-Trace-Id='\n")
-    }
-  } else {
-    if (is.null(req$HTTP_X_AMZN_SAGEMAKER_CUSTOM_ATTRIBUTES)) {
-      cat("No custom attributes found in request\n")
-    } else {
-      cat("Standard X-Ray header already found, skipping custom attributes\n")
-    }
-  }
+    final_result <- trace_operation({
+      postprocess_results(inference_result)
+    }, operation_name = "post-processing")
+    
+    # Finalize tracing
+    .finalize_xray_context(xray_context, success = TRUE)
+    
+    return(list(
+      message = "Inference completed successfully!",
+      result = final_result,
+      timestamp = format(Sys.time(), tz = "UTC", usetz = TRUE),
+      tracing_enabled = xray_context$enabled
+    ))
+    
+  }, error = function(e) {
+    # Finalize tracing with error
+    .finalize_xray_context(xray_context, success = FALSE, error_message = e$message)
+    
+    res$status <- 500
+    return(list(
+      error = "Internal server error",
+      message = e$message,
+      timestamp = format(Sys.time(), tz = "UTC", usetz = TRUE)
+    ))
+  })
+}
+
+#* @post /test-simple
+#* @serializer unboxedJSON
+function(req, res) {
+  # No X-Ray setup needed
+  payload <- fromJSON(req$postBody)
   
-  cat("X-Ray trace header:", if(is.null(incoming)) "NULL" else incoming, "\n")
-
-  # Only send X-Ray segment if we have a valid trace context from SageMaker
-  if (!is.null(incoming) && incoming != "") {
-    cat("Sending X-Ray segment with trace context\n")
-    send_xray_segment("my-inference", trace_header = incoming, annotations = list(job="async-123"))
-  } else {
-    cat("No X-Ray trace header from SageMaker - skipping segment\n")
-  }
-
-  # …your real inference logic here…
-  list(
-    message   = "Hello from R!",
-    input     = payload,
-    timestamp = format(Sys.time(), tz="UTC", usetz=TRUE),
-    xray_debug = list(
-      trace_header = incoming,
-      headers_count = length(headers[grepl("HTTP_", headers)])
-    )
+  # Create trace context for testing
+  xray_context <- list(
+    enabled = TRUE,
+    trace_header = paste0("Root=1-", toupper(as.hexmode(as.integer(Sys.time()))), "-", rand_hex(24)),
+    parent_segment_id = rand_hex(16)
   )
+  
+  # Simple business logic with automatic tracing - just wrap function calls
+  result1 <- trace_operation({
+    cat("Step 1: Validating input\n")
+    Sys.sleep(0.05)
+    if (is.null(payload$input)) stop("No input provided")
+    paste("Validated:", payload$input)
+  }, operation_name = "validation")
+  
+  result2 <- trace_operation({
+    cat("Step 2: Processing\n") 
+    Sys.sleep(0.1)
+    toupper(result1)
+  }, operation_name = "processing")
+  
+  result3 <- trace_operation({
+    cat("Step 3: Finalizing\n")
+    Sys.sleep(1)
+    paste("FINAL:", result2)
+  }, operation_name = "finalization")
+  
+  return(list(
+    message = "Simple tracing example completed!",
+    result = result3,
+    timestamp = format(Sys.time(), tz = "UTC", usetz = TRUE)
+  ))
 }
