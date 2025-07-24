@@ -18,7 +18,7 @@ echo "Test 1: Testing /invocations endpoint with X-Ray trace header"
 echo "-----------------------------------------------------------"
 curl -X POST http://localhost:8080/invocations \
     -H "Content-Type: application/json" \
-    -H "X-Amzn-Trace-Id: Root=1-$(printf '%x' $(date +%s))-$(openssl rand -hex 12)" \
+    -H "X-Amzn-Trace-Id: Root=1-$(printf '%x' $(date +%s))-$(printf '%012x' $$)" \
     -d '{"input": "test data for automatic subsegments"}' | jq .
 
 echo
@@ -39,7 +39,7 @@ echo
 # Test 3: Test with SageMaker custom attributes format (automatic detection)
 echo "Test 3: Testing with SageMaker custom attributes (automatic detection)"
 echo "--------------------------------------------------------------------"
-trace_id="Root=1-$(printf '%x' $(date +%s))-$(openssl rand -hex 12)"
+trace_id="Root=1-$(printf '%x' $(date +%s))-$(printf '%012x' $$)"
 curl -X POST http://localhost:8080/invocations \
     -H "Content-Type: application/json" \
     -H "X-Amzn-SageMaker-Custom-Attributes: X-Amzn-Trace-Id=${trace_id}" \
@@ -65,7 +65,7 @@ echo "Test 5: Testing error handling with automatic subsegments"
 echo "--------------------------------------------------------"
 curl -X POST http://localhost:8080/invocations \
     -H "Content-Type: application/json" \
-    -H "X-Amzn-Trace-Id: Root=1-$(printf '%x' $(date +%s))-$(openssl rand -hex 12)" \
+    -H "X-Amzn-Trace-Id: Root=1-$(printf '%x' $(date +%s))-$(printf '%012x' $$)" \
     -d '{"missing_input": "this will cause an error"}' | jq .
 
 echo

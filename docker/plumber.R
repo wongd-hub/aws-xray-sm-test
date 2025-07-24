@@ -6,8 +6,35 @@ library(jsonlite)
   if (!is.null(x)) x else y
 }
 
-rand_hex <- function(n) {
-  paste0(sample(c(0:9, letters[1:6]), n, replace = TRUE), collapse = "")
+# Counter for deterministic IDs
+.segment_counter <- 0
+
+# Simple deterministic hex generator (no dependencies)
+deterministic_hex <- function(n) {
+  # Use system time (microseconds), process ID, and counter for uniqueness
+  now_micro <- round(as.numeric(Sys.time()) * 1000000)
+  pid <- Sys.getpid()
+  .segment_counter <<- .segment_counter + 1
+  
+  # Create a long deterministic number and convert to hex-like string
+  combined <- paste0(now_micro, sprintf("%06d", pid), sprintf("%04d", .segment_counter))
+  
+  # Convert to lowercase hex-like characters (0-9, a-f)
+  chars <- c(0:9, letters[1:6])
+  result <- ""
+  for (i in seq_len(nchar(combined))) {
+    digit <- as.numeric(substr(combined, i, i))
+    result <- paste0(result, chars[(digit %% 16) + 1])
+  }
+  
+  # Take first n characters and pad if needed
+  if (nchar(result) < n) {
+    result <- substr(paste0(result, paste(rep("0", n), collapse = "")), 1, n)
+  } else {
+    result <- substr(result, 1, n)
+  }
+  
+  return(result)
 }
 
 extract_root <- function(trace_header) {
@@ -39,7 +66,7 @@ extract_root <- function(trace_header) {
   
   seg <- list(
     name = name,
-    id = if (!is.null(segment_id)) segment_id else rand_hex(16),
+    id = if (!is.null(segment_id)) segment_id else deterministic_hex(16),
     trace_id = trace_id,  # Use the provided trace_id directly
     start_time = start_time,
     end_time = end_time,
@@ -122,7 +149,7 @@ extract_root <- function(trace_header) {
     cat("Extracted trace ID:", if (is.null(context$trace_id)) "NULL" else context$trace_id, "\n")
     
     # Create main segment ID (but don't send segment yet - will send when complete)
-    context$parent_segment_id <- rand_hex(16)
+    context$parent_segment_id <- deterministic_hex(16)
     cat("Generated parent segment ID:", context$parent_segment_id, "\n")
   } else {
     cat("No valid trace header found, X-Ray disabled\n")
@@ -165,13 +192,26 @@ extract_root <- function(trace_header) {
 #' 
 #' @param expr R expression to execute and trace
 #' @param operation_name Name for the operation (will appear in X-Ray console)
-#' @return Result of the expression
+#' @param parent_segment_id Optional parent segment ID for creating sub-subsegments
+#' @return Result of the expression with segment_id as attribute for sub-subsegments
 #' @examples
+#' # Basic usage
 #' result <- trace_operation({
 #'   Sys.sleep(0.1)
 #'   "Hello World"
 #' }, operation_name = "my-operation")
-trace_operation <- function(expr, operation_name = "operation") {
+#' 
+#' # Sub-subsegment usage
+#' main_result <- trace_operation({
+#'   # Main operation
+#'   "main work"
+#' }, operation_name = "main-operation")
+#' 
+#' sub_result <- trace_operation({
+#'   # Sub operation
+#'   "sub work" 
+#' }, operation_name = "sub-operation", parent_segment_id = attr(main_result, "segment_id"))
+trace_operation <- function(expr, operation_name = "operation", parent_segment_id = NULL) {
   # Look for xray_context in the calling environment (thread-safe)
   context <- tryCatch({
     get("xray_context", envir = parent.frame())
@@ -184,6 +224,9 @@ trace_operation <- function(expr, operation_name = "operation") {
     return(eval.parent(substitute(expr)))
   }
   
+  # Use provided parent_segment_id for sub-subsegments, or context parent for regular subsegments
+  actual_parent_id <- if (!is.null(parent_segment_id)) parent_segment_id else context$parent_segment_id
+  
   start_time <- as.numeric(Sys.time())
   
   # Execute the expression and handle errors
@@ -191,14 +234,15 @@ trace_operation <- function(expr, operation_name = "operation") {
     result <- eval.parent(substitute(expr))
     end_time <- as.numeric(Sys.time())
     
-    cat("Creating subsegment:", operation_name, "with parent:", context$parent_segment_id, "\n")
+    cat("Creating", if(!is.null(parent_segment_id)) "sub-subsegment:" else "subsegment:", 
+        operation_name, "with parent:", actual_parent_id, "\n")
     
-    # Send successful subsegment
-    .send_xray_segment(
+    # Send successful subsegment and get the segment ID
+    segment_id <- .send_xray_segment(
       name = operation_name,
       start_time = start_time,
       end_time = end_time,
-      parent_id = context$parent_segment_id,
+      parent_id = actual_parent_id,
       trace_id = context$trace_id,  # Use stored trace_id
       annotations = list(
         duration_ms = (end_time - start_time) * 1000,
@@ -206,17 +250,20 @@ trace_operation <- function(expr, operation_name = "operation") {
       )
     )
     
+    # Add segment_id as attribute for potential sub-subsegments
+    attr(result, "segment_id") <- segment_id
+    
     return(result)
     
   }, error = function(e) {
     end_time <- as.numeric(Sys.time())
     
     # Send error subsegment
-    .send_xray_segment(
+    segment_id <- .send_xray_segment(
       name = operation_name,
       start_time = start_time,
       end_time = end_time,
-      parent_id = context$parent_segment_id,
+      parent_id = actual_parent_id,
       trace_id = context$trace_id,  # Use stored trace_id
       annotations = list(
         duration_ms = (end_time - start_time) * 1000,
@@ -330,8 +377,8 @@ function(req, res) {
   # Create trace context for testing
   xray_context <- list(
     enabled = TRUE,
-    trace_header = paste0("Root=1-", toupper(as.hexmode(as.integer(Sys.time()))), "-", rand_hex(24)),
-    parent_segment_id = rand_hex(16)
+    trace_header = paste0("Root=1-", toupper(as.hexmode(as.integer(Sys.time()))), "-", deterministic_hex(24)),
+    parent_segment_id = deterministic_hex(16)
   )
   
   # Simple business logic with automatic tracing - just wrap function calls

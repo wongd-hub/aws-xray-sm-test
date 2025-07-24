@@ -62,11 +62,36 @@ validation_result <- trace_operation({
 }, operation_name = "input-validation")
 ```
 
+### Sub-subsegments (nested operations):
+
+```r
+# Create nested subsegments for detailed tracing
+main_result <- trace_operation({
+  # Main processing work
+  process_main_data(payload)
+}, operation_name = "main-processing")
+
+# Create a sub-subsegment under the main operation
+detailed_result <- trace_operation({
+  # Detailed sub-operation
+  detailed_analysis(main_result)
+}, operation_name = "detailed-analysis", parent_segment_id = attr(main_result, "segment_id"))
+
+# Create another sub-subsegment under the detailed analysis
+final_result <- trace_operation({
+  # Final sub-operation
+  final_cleanup(detailed_result)
+}, operation_name = "final-cleanup", parent_segment_id = attr(detailed_result, "segment_id"))
+```
+
 ## That's it!
 
 - **No setup required** - X-Ray context is handled automatically
 - **Thread-safe** - Ready for concurrent requests and `future` multi-threading
+- **Zero dependencies** - Uses simple string manipulation, no external packages
 - **Same code works** with or without X-Ray enabled
+- **Sub-subsegments** - Create nested operations for detailed tracing hierarchies
+- **Deterministic** - No random number generation affects your model seeds
 - **Silent failure** - if X-Ray daemon isn't available, your code still works
 - **Automatic timing** - subsegments automatically capture duration
 - **Error handling** - failed operations are automatically marked as errors in X-Ray

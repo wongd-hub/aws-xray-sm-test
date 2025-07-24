@@ -6,8 +6,8 @@ echo "🔍 Testing X-Ray Daemon Connectivity"
 echo "======================================"
 
 # Generate a simple X-Ray trace segment
-TRACE_ID="1-$(printf '%08x' $(date +%s))-$(openssl rand -hex 12)"
-SEGMENT_ID=$(openssl rand -hex 8)
+TRACE_ID="1-$(printf '%08x' $(date +%s))-$(printf '%012x' $$)"
+SEGMENT_ID=$(printf '%08x' $$)
 
 SEGMENT='{
   "name": "test-segment",

@@ -10,7 +10,7 @@ REGION="us-east-1"
 ENDPOINT_URL="https://runtime.sagemaker.${REGION}.amazonaws.com/endpoints/${ENDPOINT_NAME}/async-invocations"
 
 # Generate a unique trace ID for X-Ray
-TRACE_ID="1-$(printf '%08x' $(date +%s))-$(openssl rand -hex 12)"
+TRACE_ID="1-$(printf '%08x' $(date +%s))-$(printf '%012x' $$)"
 
 echo "🚀 Testing SageMaker Async Endpoint with X-Ray Tracing"
 echo "======================================================"

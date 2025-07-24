@@ -1,6 +1,6 @@
 FROM rstudio/plumber:v1.0.0
 
-# 1) Install only paws/jsonlite
+# Install required R packages
 RUN Rscript -e "install.packages(c('jsonlite', 'httr'), repos='https://cran.rstudio.com')"
 
 # 2) Install X-Ray daemon and netcat

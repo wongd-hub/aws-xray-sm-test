@@ -126,7 +126,8 @@ if [ "$api_ready" = true ]; then
     fi
     
     # Send sample.json to the /invocations endpoint
-    TRACE_ID="Root=1-$(printf '%x' $(date +%s))-$(openssl rand -hex 12);Sampled=1"
+    # Deterministic trace ID using timestamp and process ID (no randomness)
+    TRACE_ID="Root=1-$(printf '%x' $(date +%s))-$(printf '%012x' $$);Sampled=1"
     log "Sending POST request to /invocations with trace ID: $TRACE_ID"
     response=$(curl -s -X POST \
       -H "Content-Type: application/json" \
